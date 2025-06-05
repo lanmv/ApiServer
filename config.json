@@ -1,0 +1,7 @@
+{
+  "database_type": "mysql",
+  "database_connection_string": "user:password@tcp(127.0.0.1:3306)/dbname?charset=utf8mb4&parseTime=True&loc=Local",
+  "service_port": "8080",
+  "api_secret_key": "your-secret-key",
+  "log_level": "info"
+}
