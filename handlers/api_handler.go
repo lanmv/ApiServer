@@ -24,13 +24,13 @@ func NewAPIHandler(db *gorm.DB, cfg *config.Config) *APIHandler {
 }
 
 type TableMetadata struct {
-	TableName     string // This will store the qualified name e.g. schema.table
-	TableType     string
-	TableSchema   string // Schema name itself
-	PrimaryKeyCol string
+	TableName     string // This will be schema-qualified for non-MySQL DBs if schema is found
+	TableType     string // E.g., 'BASE TABLE', 'VIEW', 'TABLE'
+	TableSchema   string // The actual schema name found
+	PrimaryKeyCol string // Name of the primary key column
 }
 
-// extractSchemaFromDSN (assuming this function is unchanged from previous step)
+// extractSchemaFromDSN (Copied from previous version)
 func extractSchemaFromDSN(dsn string, dbType string) string {
 	if dbType == "mysql" {
 		parts := strings.Split(dsn, "/")
@@ -47,7 +47,7 @@ func extractSchemaFromDSN(dsn string, dbType string) string {
 				return nameAndParams[0]
 			}
 		}
-		return "public" // Default to public for PostgreSQL if not in DSN
+		return "public"
 	}
 	if dbType == "sqlserver" {
 		if strings.Contains(dsn, "database=") {
@@ -73,11 +73,13 @@ func extractSchemaFromDSN(dsn string, dbType string) string {
 	return ""
 }
 
-func (h *APIHandler) GetTableMetadata(originalTableName string) (*TableMetadata, error) {
+// GetTableMetadata (Copied and refined from previous version)
+func (h *APIHandler) GetTableMetadata(tableName string) (*TableMetadata, error) {
 	var tableType sql.NullString
-	var foundSchema sql.NullString // Schema where the table was found
+	var tableSchemaVal sql.NullString // Renamed to avoid conflict with local var 'tableSchema'
 	var primaryKeyCol sql.NullString
 
+	originalTableName := tableName // Keep original name for user-facing messages if needed
 	derivedSchema := extractSchemaFromDSN(h.Cfg.DatabaseConnectionString, h.Cfg.DatabaseType)
 	log := logger.Get()
 
@@ -86,87 +88,82 @@ func (h *APIHandler) GetTableMetadata(originalTableName string) (*TableMetadata,
 	var args []interface{}
 	var pkArgs []interface{}
 
-    // This will be the name used for GORM operations, potentially schema-qualified
-    tableNameForGorm := originalTableName
+	currentSchemaForQuery := derivedSchema // This will be used in queries
 
 	switch h.Cfg.DatabaseType {
 	case "mysql":
-		// MySQL schema is the database name from DSN. GORM handles this contextually.
-		// No prefix needed for tableNameForGorm. derivedSchema is used for INFORMATION_SCHEMA.
-		if derivedSchema == "" {
-			return nil, fmt.Errorf("MySQL schema (database) could not be determined from DSN for table: %s", originalTableName)
+		if currentSchemaForQuery == "" {
+			return nil, fmt.Errorf("MySQL schema (database name) could not be determined from DSN for table: %s", originalTableName)
 		}
 		query = "SELECT T.TABLE_TYPE, T.TABLE_SCHEMA FROM INFORMATION_SCHEMA.TABLES T WHERE T.TABLE_SCHEMA = ? AND T.TABLE_NAME = ?"
-		args = []interface{}{derivedSchema, originalTableName}
+		args = []interface{}{currentSchemaForQuery, originalTableName}
 		pkQuery = "SELECT K.COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE K JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS C ON K.CONSTRAINT_NAME = C.CONSTRAINT_NAME AND K.TABLE_SCHEMA = C.TABLE_SCHEMA AND K.TABLE_NAME = C.TABLE_NAME WHERE C.CONSTRAINT_TYPE = 'PRIMARY KEY' AND K.TABLE_SCHEMA = ? AND K.TABLE_NAME = ? ORDER BY K.ORDINAL_POSITION LIMIT 1"
-		pkArgs = []interface{}{derivedSchema, originalTableName}
-        // tableNameForGorm remains originalTableName for MySQL
+		pkArgs = []interface{}{currentSchemaForQuery, originalTableName}
 	case "postgres":
-		currentSchema := derivedSchema
-		if currentSchema == "" { currentSchema = "public" }
+		if currentSchemaForQuery == "" { currentSchemaForQuery = "public" }
 		query = "SELECT t.table_type, t.table_schema FROM information_schema.tables t WHERE t.table_schema = ? AND t.table_name = ?"
-		args = []interface{}{currentSchema, originalTableName}
+		args = []interface{}{currentSchemaForQuery, originalTableName}
 		pkQuery = "SELECT kcu.column_name FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema AND tc.table_name = kcu.table_name WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = ? AND tc.table_name = ? ORDER BY kcu.ordinal_position LIMIT 1"
-		pkArgs = []interface{}{currentSchema, originalTableName}
-		tableNameForGorm = fmt.Sprintf("%s.%s", currentSchema, originalTableName)
+		pkArgs = []interface{}{currentSchemaForQuery, originalTableName}
 	case "sqlserver":
-		dbName := derivedSchema // Database (catalog) name
+		dbName := currentSchemaForQuery // For SQL Server, derivedSchema is the database name (catalog)
 		if dbName == "" {
-             return nil, fmt.Errorf("SQL Server database name could not be determined for table: %s", originalTableName)
+             return nil, fmt.Errorf("SQL Server database name could not be determined from DSN for table: %s", originalTableName)
         }
-        var actualSchema string = "dbo" // Default schema
+        // Determine the actual schema (like 'dbo') for the table
+        var actualSchemaForTable string = "dbo" // Default
         schemaQuery := "SELECT TOP 1 TABLE_SCHEMA FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_CATALOG = ? AND TABLE_NAME = ?"
-        errScan := h.DB.Raw(schemaQuery, dbName, originalTableName).Scan(&actualSchema).Error
-        if errScan != nil && errScan != gorm.ErrRecordNotFound {
-            log.Warnf("Failed to query actual schema for SQL Server table %s: %v. Defaulting to 'dbo'.", originalTableName, errScan)
+        errSchema := h.DB.Raw(schemaQuery, dbName, originalTableName).Scan(&actualSchemaForTable).Error
+        if errSchema != nil && errSchema != gorm.ErrRecordNotFound { // Check for actual error, not just no rows
+             log.Warnf("Failed to query actual schema for SQL Server table %s in DB %s, defaulting to 'dbo'. Error: %v", originalTableName, dbName, errSchema)
         }
-        if actualSchema == "" { actualSchema = "dbo" }
+        if actualSchemaForTable == "" {actualSchemaForTable = "dbo"} // Ensure it's not empty if scan resulted in empty string
+        currentSchemaForQuery = actualSchemaForTable // This is the schema like 'dbo'
 
 		query = "SELECT TABLE_TYPE, TABLE_SCHEMA FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = ? AND TABLE_CATALOG = ? AND TABLE_SCHEMA = ?"
-		args = []interface{}{originalTableName, dbName, actualSchema}
+		args = []interface{}{originalTableName, dbName, currentSchemaForQuery}
 		pkQuery = "SELECT TOP 1 KU.COLUMN_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS TC INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS KU ON TC.CONSTRAINT_TYPE = 'PRIMARY KEY' AND TC.CONSTRAINT_NAME = KU.CONSTRAINT_NAME AND KU.table_name = TC.table_name WHERE KU.TABLE_CATALOG = ? AND KU.TABLE_SCHEMA = ? AND KU.TABLE_NAME = ? ORDER BY KU.ORDINAL_POSITION"
-        pkArgs = []interface{}{dbName, actualSchema, originalTableName}
-        tableNameForGorm = fmt.Sprintf("%s.%s", actualSchema, originalTableName)
+        pkArgs = []interface{}{dbName, currentSchemaForQuery, originalTableName}
 	case "oracle":
-		ownerSchema := derivedSchema
+		ownerSchema := currentSchemaForQuery
 		if ownerSchema == "" {
-            return nil, fmt.Errorf("Oracle schema (owner) could not be determined for table: %s", originalTableName)
+            return nil, fmt.Errorf("Oracle schema (owner) could not be determined from DSN for table: %s", originalTableName)
         }
-		oracleQuery := `
+		query = `
             SELECT
                 CASE
-                    WHEN (SELECT COUNT(*) FROM ALL_TABLES WHERE TABLE_NAME = ? AND OWNER = ?) > 0 THEN 'BASE TABLE'
-                    WHEN (SELECT COUNT(*) FROM ALL_VIEWS WHERE VIEW_NAME = ? AND OWNER = ?) > 0 THEN 'VIEW'
+                    WHEN (SELECT COUNT(*) FROM ALL_TABLES WHERE TABLE_NAME = :1 AND OWNER = :2) > 0 THEN 'BASE TABLE'
+                    WHEN (SELECT COUNT(*) FROM ALL_VIEWS WHERE VIEW_NAME = :1 AND OWNER = :2) > 0 THEN 'VIEW'
                     ELSE NULL
                 END AS OBJECT_TYPE,
-                ? AS OBJECT_SCHEMA
+                :2 AS OBJECT_SCHEMA
             FROM DUAL`
-		query = oracleQuery
+        query = strings.ReplaceAll(strings.ReplaceAll(query, ":1", "?"), ":2", "?")
 		args = []interface{}{originalTableName, ownerSchema, originalTableName, ownerSchema, ownerSchema}
+
         pkQuery = "SELECT COLS.COLUMN_NAME FROM ALL_CONSTRAINTS CONS INNER JOIN ALL_CONS_COLUMNS COLS ON CONS.OWNER = COLS.OWNER AND CONS.CONSTRAINT_NAME = COLS.CONSTRAINT_NAME WHERE CONS.CONSTRAINT_TYPE = 'P' AND CONS.OWNER = ? AND CONS.TABLE_NAME = ? AND ROWNUM = 1 ORDER BY COLS.POSITION"
         pkArgs = []interface{}{ownerSchema, originalTableName}
-        tableNameForGorm = fmt.Sprintf("%s.%s", ownerSchema, originalTableName)
 	default:
 		return nil, fmt.Errorf("unsupported database type for metadata query: %s", h.Cfg.DatabaseType)
 	}
 
-	log.Debugf("Meta Query: %s, Args: %v", query, args)
+	log.Debugf("Meta Query for %s: %s, Args: %v", originalTableName, query, args)
 	row := h.DB.Raw(query, args...).Row()
-	err := row.Scan(&tableType, &foundSchema)
+	err := row.Scan(&tableType, &tableSchemaVal)
 
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("table/view '%s' not found in derived/default schema '%s'", originalTableName, derivedSchema)
+			return nil, fmt.Errorf("table/view '%s' not found in schema '%s' (or default)", originalTableName, currentSchemaForQuery)
 		}
 		log.Errorf("DB error fetching metadata for '%s': %v. Query: %s", originalTableName, err, query)
-		return nil, fmt.Errorf("DB error for '%s': %w", originalTableName, err)
+		return nil, fmt.Errorf("database error for '%s': %w", originalTableName, err)
 	}
     if !tableType.Valid || tableType.String == "" {
          return nil, fmt.Errorf("table/view '%s' type unknown/unsupported", originalTableName)
     }
 
 	if pkQuery != "" {
-		log.Debugf("PK Query: %s, Args: %v", pkQuery, pkArgs)
+		log.Debugf("PK Query for %s: %s, Args: %v", originalTableName, pkQuery, pkArgs)
 		pkRow := h.DB.Raw(pkQuery, pkArgs...).Row()
 		errPK := pkRow.Scan(&primaryKeyCol)
 		if errPK != nil && errPK != sql.ErrNoRows {
@@ -176,34 +173,33 @@ func (h *APIHandler) GetTableMetadata(originalTableName string) (*TableMetadata,
 		}
 	}
 
-    schemaToStore := foundSchema.String
-    if !foundSchema.Valid || foundSchema.String == "" {
-        // If query didn't return schema (e.g. Oracle DUAL query), use derived/default
-        if h.Cfg.DatabaseType == "oracle" { schemaToStore = derivedSchema }
-        if h.Cfg.DatabaseType == "postgres" && derivedSchema == "" { schemaToStore = "public" }
-        if h.Cfg.DatabaseType == "sqlserver" {
-            // The actualSchema was determined earlier for SQL Server
-            var tempActualSchema string = "dbo"
-            schemaQ := "SELECT TOP 1 TABLE_SCHEMA FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_CATALOG = ? AND TABLE_NAME = ?"
-            h.DB.Raw(schemaQ, derivedSchema, originalTableName).Scan(&tempActualSchema)
-            if tempActualSchema != "" { schemaToStore = tempActualSchema } else { schemaToStore = "dbo" }
-        }
+    qualifiedTableNameForGorm := originalTableName
+    finalSchema := currentSchemaForQuery // Default to derived/default schema
+    if tableSchemaVal.Valid && tableSchemaVal.String != "" {
+        finalSchema = tableSchemaVal.String // Use schema found by query if valid
+    }
+
+    if finalSchema != "" && h.Cfg.DatabaseType != "mysql" {
+        qualifiedTableNameForGorm = finalSchema + "." + originalTableName
     }
 
 
 	metadata := &TableMetadata{
-		TableName:     tableNameForGorm, // Store qualified name for GORM
+		TableName:     qualifiedTableNameForGorm,
 		TableType:     strings.ToUpper(tableType.String),
-		TableSchema:   schemaToStore, // Actual schema from query or derived
+		TableSchema:   finalSchema,
 		PrimaryKeyCol: primaryKeyCol.String,
 	}
-	log.Infof("Metadata for '%s' (GORM Table: %s): Type=%s, Schema=%s, PK=%s", originalTableName, metadata.TableName, metadata.TableType, metadata.TableSchema, metadata.PrimaryKeyCol)
+	log.Infof("Metadata for '%s' (GORM uses: %s): Type=%s, Schema=%s, PK=%s", originalTableName, metadata.TableName, metadata.TableType, metadata.TableSchema, metadata.PrimaryKeyCol)
 	return metadata, nil
 }
 
+
+// handleGetRequest (Copied from previous version)
 func (h *APIHandler) handleGetRequest(c *gin.Context, metadata *TableMetadata) {
 	log := logger.Get()
-	db := h.DB.Table(metadata.TableName) // metadata.TableName is now qualified
+	db := h.DB.Table(metadata.TableName)
+
 
 	current, _ := strconv.Atoi(c.DefaultQuery("current", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "10"))
@@ -240,7 +236,7 @@ func (h *APIHandler) handleGetRequest(c *gin.Context, metadata *TableMetadata) {
 			colName = parts[0]
 			opStr = strings.TrimSuffix(parts[1], "]")
 		}
-		quotedCol := clause.Column{Name: colName}.Name
+		quotedCol := clause.Column{Name: colName}.Name // GORM handles actual quoting
 		var condition string
 		switch opStr {
 		case "", "$eq": condition = fmt.Sprintf("%s = ?", quotedCol); values = append(values, value)
@@ -256,12 +252,13 @@ func (h *APIHandler) handleGetRequest(c *gin.Context, metadata *TableMetadata) {
 				placeholders := strings.Repeat("?,", len(inValues)-1) + "?"
 				op := "IN"; if opStr == "$nin" { op = "NOT IN" }
 				condition = fmt.Sprintf("%s %s (%s)", quotedCol, op, placeholders)
-				for _, v_ := range inValues { values = append(values, v_) } // Renamed v to v_
+				for _, v_ := range inValues { values = append(values, v_) }
 			}
 		default: log.Warnf("Unsupported op: %s for %s", opStr, colName); continue
 		}
 		if condition != "" { conditions = append(conditions, condition) }
 	}
+
 
 	if len(conditions) > 0 {
 		db = db.Where(strings.Join(conditions, " AND "), values...)
@@ -290,6 +287,7 @@ func (h *APIHandler) handleGetRequest(c *gin.Context, metadata *TableMetadata) {
 	})
 }
 
+// handlePostRequest (Copied from previous version)
 func (h *APIHandler) handlePostRequest(c *gin.Context, metadata *TableMetadata) {
 	log := logger.Get()
 	var recordData map[string]interface{}
@@ -299,7 +297,7 @@ func (h *APIHandler) handlePostRequest(c *gin.Context, metadata *TableMetadata) 
 		return
 	}
 	log.Debugf("Attempting to create in %s with: %v", metadata.TableName, recordData)
-	result := h.DB.Table(metadata.TableName).Create(&recordData) // metadata.TableName is qualified
+	result := h.DB.Table(metadata.TableName).Create(&recordData)
 	if result.Error != nil {
 		log.Errorf("Error creating in %s: %v", metadata.TableName, result.Error)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create", "details": result.Error.Error()})
@@ -309,6 +307,7 @@ func (h *APIHandler) handlePostRequest(c *gin.Context, metadata *TableMetadata) 
 	c.JSON(http.StatusCreated, recordData)
 }
 
+// handleGetSingleRecord (Copied from previous version)
 func (h *APIHandler) handleGetSingleRecord(c *gin.Context, metadata *TableMetadata, id string) {
     log := logger.Get()
     if metadata.PrimaryKeyCol == "" {
@@ -318,7 +317,6 @@ func (h *APIHandler) handleGetSingleRecord(c *gin.Context, metadata *TableMetada
     }
 
     var result map[string]interface{}
-    // metadata.TableName is already qualified (e.g. schema.table)
     dbResult := h.DB.Table(metadata.TableName).Where(fmt.Sprintf("%s = ?", metadata.PrimaryKeyCol), id).First(&result)
 
     if dbResult.Error != nil {
@@ -336,6 +334,7 @@ func (h *APIHandler) handleGetSingleRecord(c *gin.Context, metadata *TableMetada
     c.JSON(http.StatusOK, result)
 }
 
+// handleUpdateRequest (Copied from previous version, with slight refinement for 404 on 0 rows affected)
 func (h *APIHandler) handleUpdateRequest(c *gin.Context, metadata *TableMetadata, id string) {
 	log := logger.Get()
 
@@ -344,22 +343,15 @@ func (h *APIHandler) handleUpdateRequest(c *gin.Context, metadata *TableMetadata
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No primary key defined for this table to identify record for update."})
 		return
 	}
-
 	var recordData map[string]interface{}
 	if err := c.ShouldBindJSON(&recordData); err != nil {
 		log.Errorf("Error binding JSON for update request to table %s (ID: %s): %v", metadata.TableName, id, err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON data", "details": err.Error()})
 		return
 	}
-    // Ensure the PK is not part of the update payload if it's different from the ID in path,
-    // or handle it according to application rules (e.g. disallow PK change).
-    // For simplicity, GORM's Updates won't update PK if it's a standard auto-incrementing GORM model.
-    // With map[string]interface{}, it might try if present. It's safer to remove it from map.
     delete(recordData, metadata.PrimaryKeyCol)
 
-
 	log.Debugf("Attempting to update record in table %s (ID: %s) with data: %v", metadata.TableName, id, recordData)
-    // metadata.TableName is already qualified (e.g. schema.table)
 	result := h.DB.Table(metadata.TableName).Where(fmt.Sprintf("%s = ?", metadata.PrimaryKeyCol), id).Updates(recordData)
 
 	if result.Error != nil {
@@ -369,16 +361,18 @@ func (h *APIHandler) handleUpdateRequest(c *gin.Context, metadata *TableMetadata
 	}
 
 	if result.RowsAffected == 0 {
-		// Check if record actually exists, could be 0 rows affected if data is same or record not found
-        var count int64
-        h.DB.Table(metadata.TableName).Where(fmt.Sprintf("%s = ?", metadata.PrimaryKeyCol), id).Count(&count)
-        if count == 0 {
-            log.Warnf("No record found to update in table %s with ID %s.", metadata.TableName, id)
-            c.JSON(http.StatusNotFound, gin.H{"error": "Record not found."})
-            return
-        }
-        log.Warnf("Record in table %s with ID %s was not updated (data might be identical or hook prevented update). RowsAffected: 0", metadata.TableName, id)
-        // Return 200 with current data or a specific message
+		var count int64
+		h.DB.Table(metadata.TableName).Where(fmt.Sprintf("%s = ?", metadata.PrimaryKeyCol), id).Count(&count)
+		if count == 0 {
+			log.Warnf("No record found to update in table %s with ID %s.", metadata.TableName, id)
+			c.JSON(http.StatusNotFound, gin.H{"error": "Record not found."})
+		} else {
+			log.Infof("Record in table %s with ID %s was not updated (data may be identical or hooks prevented update). Rows affected: 0", metadata.TableName, id)
+			var existingRecord map[string]interface{}
+			h.DB.Table(metadata.TableName).Where(fmt.Sprintf("%s = ?", metadata.PrimaryKeyCol), id).First(&existingRecord)
+			c.JSON(http.StatusOK, existingRecord)
+		}
+		return
 	}
 
 	var updatedRecord map[string]interface{}
@@ -393,25 +387,60 @@ func (h *APIHandler) handleUpdateRequest(c *gin.Context, metadata *TableMetadata
 	c.JSON(http.StatusOK, updatedRecord)
 }
 
-func (h *APIHandler) HandleDynamicRequest(c *gin.Context) {
-	userFacingTableName := c.Param("tableName") // Original name from path
+// handleDeleteRequest implements logic for DELETE to remove a record.
+func (h *APIHandler) handleDeleteRequest(c *gin.Context, metadata *TableMetadata, id string) {
 	log := logger.Get()
 
-	metadata, err := h.GetTableMetadata(userFacingTableName)
+	if metadata.PrimaryKeyCol == "" {
+		log.Errorf("No primary key defined for table %s, cannot delete by ID.", metadata.TableName)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No primary key defined for this table to identify record for deletion."})
+		return
+	}
+
+	log.Debugf("Attempting to delete record in table %s (ID: %s)", metadata.TableName, id)
+
+	// GORM's Delete method requires a pointer to a struct or map.
+	// For dynamic tables, an empty map is suitable when using .Table() and .Where().
+	// The actual type of the argument to Delete() doesn't matter much here as long as it's a pointer.
+	result := h.DB.Table(metadata.TableName).Where(fmt.Sprintf("%s = ?", metadata.PrimaryKeyCol), id).Delete(&map[string]interface{}{})
+
+	if result.Error != nil {
+		log.Errorf("Error deleting record in table %s (ID: %s): %v", metadata.TableName, id, result.Error)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete record", "details": result.Error.Error()})
+		return
+	}
+
+	if result.RowsAffected == 0 {
+		log.Warnf("No record found to delete in table %s with ID %s.", metadata.TableName, id)
+		c.JSON(http.StatusNotFound, gin.H{"error": "Record not found."})
+		return
+	}
+
+	log.Infof("Successfully deleted record in table %s (ID: %s). Rows affected: %d.", metadata.TableName, id, result.RowsAffected)
+	c.Status(http.StatusNoContent)
+}
+
+
+// HandleDynamicRequest routes requests for /api/v1/:tableName (GET list, POST create)
+func (h *APIHandler) HandleDynamicRequest(c *gin.Context) {
+	tableName := c.Param("tableName")
+	log := logger.Get()
+
+	metadata, err := h.GetTableMetadata(tableName)
 	if err != nil {
-		log.Errorf("HandleDynamicRequest: Error getting metadata for table %s: %v", userFacingTableName, err)
+		log.Errorf("Error getting metadata for table %s: %v", tableName, err)
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
 
-	log.Infof("HandleDynamicRequest: Routing for %s: %s (GORM Table: %s, Type: %s, Schema: %s, PK: %s)",
-		c.Request.Method, userFacingTableName, metadata.TableName, metadata.TableType, metadata.TableSchema, metadata.PrimaryKeyCol)
+	log.Infof("Routing request for %s: %s (GORM uses: %s, Type: %s, Schema: %s, PK: %s)",
+		c.Request.Method, tableName, metadata.TableName, metadata.TableType, metadata.TableSchema, metadata.PrimaryKeyCol)
 
 	isModificationMethod := c.Request.Method == http.MethodPost
 	isTable := metadata.TableType == "BASE TABLE" || metadata.TableType == "TABLE"
 
 	if isModificationMethod && !isTable {
-		log.Warnf("HandleDynamicRequest: %s attempt on non-table type: %s for %s", c.Request.Method, metadata.TableType, userFacingTableName)
+		log.Warnf("%s attempt on non-table type: %s for %s", c.Request.Method, metadata.TableType, tableName)
 		c.JSON(http.StatusMethodNotAllowed, gin.H{"error": fmt.Sprintf("%s operation only allowed on tables, not %s.", c.Request.Method, metadata.TableType)})
 		return
 	}
@@ -422,31 +451,32 @@ func (h *APIHandler) HandleDynamicRequest(c *gin.Context) {
 	case http.MethodPost:
 		h.handlePostRequest(c, metadata)
 	default:
-		log.Warnf("HandleDynamicRequest: Unsupported method %s for %s", c.Request.Method, userFacingTableName)
+		log.Warnf("Unsupported method %s routed to HandleDynamicRequest for %s", c.Request.Method, tableName)
 		c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "Method not allowed for this resource path."})
 	}
 }
 
+// HandleDynamicRequestWithID routes requests for /api/v1/:tableName/:id
 func (h *APIHandler) HandleDynamicRequestWithID(c *gin.Context) {
-	userFacingTableName := c.Param("tableName")
+	tableName := c.Param("tableName")
 	id := c.Param("id")
 	log := logger.Get()
 
-	metadata, err := h.GetTableMetadata(userFacingTableName)
+	metadata, err := h.GetTableMetadata(tableName)
 	if err != nil {
-		log.Errorf("HandleDynamicRequestWithID: Error getting metadata for table %s: %v", userFacingTableName, err)
+		log.Errorf("Error getting metadata for table %s: %v", tableName, err)
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
 
-	log.Infof("HandleDynamicRequestWithID: Routing for %s: %s/%s (GORM Table: %s, Type: %s, Schema: %s, PK: %s)",
-		c.Request.Method, userFacingTableName, id, metadata.TableName, metadata.TableType, metadata.TableSchema, metadata.PrimaryKeyCol)
+	log.Infof("Routing ID-based request for %s: %s/%s (GORM uses: %s, Type: %s, Schema: %s, PK: %s)",
+		c.Request.Method, tableName, id, metadata.TableName, metadata.TableType, metadata.TableSchema, metadata.PrimaryKeyCol)
 
 	isModificationMethod := c.Request.Method == http.MethodPut || c.Request.Method == http.MethodPatch || c.Request.Method == http.MethodDelete
 	isTable := metadata.TableType == "BASE TABLE" || metadata.TableType == "TABLE"
 
 	if isModificationMethod && !isTable {
-		log.Warnf("HandleDynamicRequestWithID: %s attempt on non-table type: %s for %s/%s", c.Request.Method, metadata.TableType, userFacingTableName, id)
+		log.Warnf("%s attempt on non-table type: %s for %s/%s", c.Request.Method, metadata.TableType, tableName, id)
 		c.JSON(http.StatusMethodNotAllowed, gin.H{"error": fmt.Sprintf("%s operation only allowed on tables, not %s.", c.Request.Method, metadata.TableType)})
 		return
 	}
@@ -457,9 +487,9 @@ func (h *APIHandler) HandleDynamicRequestWithID(c *gin.Context) {
 	case http.MethodPut, http.MethodPatch:
 		h.handleUpdateRequest(c, metadata, id)
 	case http.MethodDelete:
-		c.JSON(http.StatusNotImplemented, gin.H{"message": "DELETE operation not yet implemented."})
+		h.handleDeleteRequest(c, metadata, id)
 	default:
-		log.Warnf("HandleDynamicRequestWithID: Unsupported method %s for %s/%s", c.Request.Method, userFacingTableName, id)
+		log.Warnf("Unsupported method %s routed to HandleDynamicRequestWithID for %s/%s", c.Request.Method, tableName, id)
 		c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "Method not allowed for this resource path."})
 	}
 }

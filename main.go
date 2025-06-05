@@ -9,6 +9,7 @@ import (
 	"generic-database-service/database"
 	"generic-database-service/handlers"
 	"generic-database-service/logger"
+	"generic-database-service/middleware"
 
 	"github.com/gin-gonic/gin"
 )
@@ -25,7 +26,6 @@ func main() {
 	appLogger := logger.Get()
 	appLogger.Info("Logger initialized successfully.")
 
-	// Create a standard logger for GORM for now
 	gormStdLogger := log.New(os.Stdout, "[GORM] ", log.LstdFlags)
 	db, err := database.InitDB(cfg, gormStdLogger)
 	if err != nil {
@@ -35,23 +35,38 @@ func main() {
 
 	apiHandler := handlers.NewAPIHandler(db, &cfg)
 
-	router := gin.Default()
+	router := gin.New()
+
+	// Register global middleware
+	// 1. Request/Response Logger
+	router.Use(middleware.RequestResponseLogger(appLogger))
+	// 2. Panic Recovery
+	router.Use(gin.Recovery())
+	// 3. API Key Authentication (must be after logger to see its effect, before routes)
+	router.Use(middleware.APIKeyAuth(cfg.APISecretKey, appLogger))
+
 
 	v1 := router.Group("/api/v1")
 	{
-		// Routes without an ID parameter
-		v1.GET("/:tableName", apiHandler.HandleDynamicRequest)  // List/Query
-		v1.POST("/:tableName", apiHandler.HandleDynamicRequest) // Create
+		// Collection routes
+		v1.GET("/:tableName", apiHandler.HandleDynamicRequest)
+		v1.POST("/:tableName", apiHandler.HandleDynamicRequest)
 
-		// Routes with an ID parameter
-		v1.GET("/:tableName/:id", apiHandler.HandleDynamicRequestWithID)    // Get single record by ID
-		v1.PUT("/:tableName/:id", apiHandler.HandleDynamicRequestWithID)    // Update record by ID
-		v1.PATCH("/:tableName/:id", apiHandler.HandleDynamicRequestWithID)  // Partial update record by ID
-		v1.DELETE("/:tableName/:id", apiHandler.HandleDynamicRequestWithID) // Delete record by ID
+		// Specific record routes
+		v1.GET("/:tableName/:id", apiHandler.HandleDynamicRequestWithID)
+		v1.PUT("/:tableName/:id", apiHandler.HandleDynamicRequestWithID)
+		v1.PATCH("/:tableName/:id", apiHandler.HandleDynamicRequestWithID)
+		v1.DELETE("/:tableName/:id", apiHandler.HandleDynamicRequestWithID)
 	}
 
 	listenAddr := fmt.Sprintf(":%s", cfg.ServicePort)
 	appLogger.Infof("Starting server on %s", listenAddr)
+	if cfg.APISecretKey == "" {
+		appLogger.Warn("API Secret Key is not configured. API authentication is disabled.")
+	} else {
+		appLogger.Info("API Secret Key authentication is enabled.")
+	}
+
 	if err := router.Run(listenAddr); err != nil {
 		appLogger.Fatalf("Failed to start server: %v", err)
 	}
