@@ -24,10 +24,10 @@ func NewAPIHandler(db *gorm.DB, cfg *config.Config) *APIHandler {
 }
 
 type TableMetadata struct {
-	TableName     string // This will be schema-qualified for non-MySQL DBs if schema is found
-	TableType     string // E.g., 'BASE TABLE', 'VIEW', 'TABLE'
-	TableSchema   string // The actual schema name found
-	PrimaryKeyCol string // Name of the primary key column
+	TableName     string
+	TableType     string
+	TableSchema   string
+	PrimaryKeyCol string
 }
 
 // extractSchemaFromDSN (Copied from previous version)
@@ -76,10 +76,10 @@ func extractSchemaFromDSN(dsn string, dbType string) string {
 // GetTableMetadata (Copied and refined from previous version)
 func (h *APIHandler) GetTableMetadata(tableName string) (*TableMetadata, error) {
 	var tableType sql.NullString
-	var tableSchemaVal sql.NullString // Renamed to avoid conflict with local var 'tableSchema'
+	var tableSchemaVal sql.NullString
 	var primaryKeyCol sql.NullString
 
-	originalTableName := tableName // Keep original name for user-facing messages if needed
+	originalTableName := tableName
 	derivedSchema := extractSchemaFromDSN(h.Cfg.DatabaseConnectionString, h.Cfg.DatabaseType)
 	log := logger.Get()
 
@@ -88,7 +88,7 @@ func (h *APIHandler) GetTableMetadata(tableName string) (*TableMetadata, error) 
 	var args []interface{}
 	var pkArgs []interface{}
 
-	currentSchemaForQuery := derivedSchema // This will be used in queries
+	currentSchemaForQuery := derivedSchema
 
 	switch h.Cfg.DatabaseType {
 	case "mysql":
@@ -106,19 +106,18 @@ func (h *APIHandler) GetTableMetadata(tableName string) (*TableMetadata, error) 
 		pkQuery = "SELECT kcu.column_name FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema AND tc.table_name = kcu.table_name WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = ? AND tc.table_name = ? ORDER BY kcu.ordinal_position LIMIT 1"
 		pkArgs = []interface{}{currentSchemaForQuery, originalTableName}
 	case "sqlserver":
-		dbName := currentSchemaForQuery // For SQL Server, derivedSchema is the database name (catalog)
+		dbName := currentSchemaForQuery
 		if dbName == "" {
              return nil, fmt.Errorf("SQL Server database name could not be determined from DSN for table: %s", originalTableName)
         }
-        // Determine the actual schema (like 'dbo') for the table
-        var actualSchemaForTable string = "dbo" // Default
+        var actualSchemaForTable string = "dbo"
         schemaQuery := "SELECT TOP 1 TABLE_SCHEMA FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_CATALOG = ? AND TABLE_NAME = ?"
         errSchema := h.DB.Raw(schemaQuery, dbName, originalTableName).Scan(&actualSchemaForTable).Error
-        if errSchema != nil && errSchema != gorm.ErrRecordNotFound { // Check for actual error, not just no rows
-             log.Warnf("Failed to query actual schema for SQL Server table %s in DB %s, defaulting to 'dbo'. Error: %v", originalTableName, dbName, errSchema)
+        if errSchema != nil && errSchema != gorm.ErrRecordNotFound {
+            log.Warnf("Could not determine schema for SQL Server table %s in DB %s, defaulting to 'dbo'. Error: %v", originalTableName, dbName, errSchema)
         }
-        if actualSchemaForTable == "" {actualSchemaForTable = "dbo"} // Ensure it's not empty if scan resulted in empty string
-        currentSchemaForQuery = actualSchemaForTable // This is the schema like 'dbo'
+         if actualSchemaForTable == "" {actualSchemaForTable = "dbo"}
+        currentSchemaForQuery = actualSchemaForTable
 
 		query = "SELECT TABLE_TYPE, TABLE_SCHEMA FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = ? AND TABLE_CATALOG = ? AND TABLE_SCHEMA = ?"
 		args = []interface{}{originalTableName, dbName, currentSchemaForQuery}
@@ -174,15 +173,14 @@ func (h *APIHandler) GetTableMetadata(tableName string) (*TableMetadata, error) 
 	}
 
     qualifiedTableNameForGorm := originalTableName
-    finalSchema := currentSchemaForQuery // Default to derived/default schema
+    finalSchema := currentSchemaForQuery
     if tableSchemaVal.Valid && tableSchemaVal.String != "" {
-        finalSchema = tableSchemaVal.String // Use schema found by query if valid
+        finalSchema = tableSchemaVal.String
     }
 
     if finalSchema != "" && h.Cfg.DatabaseType != "mysql" {
         qualifiedTableNameForGorm = finalSchema + "." + originalTableName
     }
-
 
 	metadata := &TableMetadata{
 		TableName:     qualifiedTableNameForGorm,
@@ -194,6 +192,119 @@ func (h *APIHandler) GetTableMetadata(tableName string) (*TableMetadata, error) 
 	return metadata, nil
 }
 
+// _getSchemaForListing determines the schema to use for listing tables/views.
+func (h *APIHandler) _getSchemaForListing() (schema string, dbNameForCatalog string, err error) {
+	derivedSchema := extractSchemaFromDSN(h.Cfg.DatabaseConnectionString, h.Cfg.DatabaseType)
+	log := logger.Get()
+
+	switch h.Cfg.DatabaseType {
+	case "mysql":
+		if derivedSchema == "" {
+			return "", "", fmt.Errorf("MySQL schema (database name) could not be determined from DSN")
+		}
+		log.Debugf("Schema for MySQL listing: %s", derivedSchema)
+		return derivedSchema, derivedSchema, nil
+	case "postgres":
+		schemaToList := derivedSchema
+		if schemaToList == "" {
+			schemaToList = "public"
+		}
+		log.Debugf("Schema for PostgreSQL listing: %s", schemaToList)
+		return schemaToList, schemaToList, nil
+	case "sqlserver":
+		dbName := derivedSchema
+		if dbName == "" {
+			return "", "", fmt.Errorf("SQL Server database name (catalog) could not be determined from DSN")
+		}
+		// For SQL Server, typically list from 'dbo' within the specified database (catalog).
+		// This could be made configurable if tables from other schemas need to be listed by default.
+		log.Debugf("Catalog for SQL Server listing: %s, Schema: dbo (default)", dbName)
+		return "dbo", dbName, nil
+	case "oracle":
+		if derivedSchema == "" {
+			return "", "", fmt.Errorf("Oracle schema (owner) could not be determined from DSN")
+		}
+		log.Debugf("Schema (owner) for Oracle listing: %s", derivedSchema)
+		return derivedSchema, "", nil
+	default:
+		return "", "", fmt.Errorf("unsupported database type for listing: %s", h.Cfg.DatabaseType)
+	}
+}
+
+
+// _getAllTablesOrViews is an internal helper to fetch either tables or views.
+func (h *APIHandler) _getAllTablesOrViews(fetchTables bool) ([]string, error) {
+	log := logger.Get()
+	var results []string
+	var query string
+	var args []interface{}
+
+	schema, dbNameForCatalog, err := h._getSchemaForListing()
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine schema for listing: %w", err)
+	}
+
+	objectType := "VIEW"
+	if fetchTables {
+		objectType = "BASE TABLE"
+	}
+
+	switch h.Cfg.DatabaseType {
+	case "mysql":
+		query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = ? ORDER BY TABLE_NAME"
+		args = []interface{}{schema, objectType}
+	case "postgres":
+		query = "SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_type = ? ORDER BY table_name"
+		args = []interface{}{schema, objectType}
+	case "sqlserver":
+		query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_CATALOG = ? AND TABLE_SCHEMA = ? AND TABLE_TYPE = ? ORDER BY TABLE_NAME"
+		args = []interface{}{dbNameForCatalog, schema, objectType}
+	case "oracle":
+		if fetchTables {
+			query = "SELECT TABLE_NAME FROM ALL_TABLES WHERE OWNER = :1 ORDER BY TABLE_NAME"
+		} else {
+			query = "SELECT VIEW_NAME AS TABLE_NAME FROM ALL_VIEWS WHERE OWNER = :1 ORDER BY VIEW_NAME"
+		}
+        query = strings.ReplaceAll(query, ":1", "?")
+		args = []interface{}{schema}
+	default:
+		return nil, fmt.Errorf("database type %s not supported for listing tables/views", h.Cfg.DatabaseType)
+	}
+
+	log.Debugf("Listing %s: Query: %s, Args: %v", objectType+"s", query, args)
+	rows, err := h.DB.Raw(query, args...).Rows()
+	if err != nil {
+		log.Errorf("Error executing query to list %s: %v", objectType+"s", err)
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			log.Errorf("Error scanning %s name: %v", objectType+"s", err)
+			return nil, err
+		}
+		results = append(results, name)
+	}
+	if err = rows.Err(); err != nil {
+        log.Errorf("Error iterating rows for %s: %v", objectType+"s", err)
+        return nil, err
+    }
+
+	log.Infof("Found %d %s in schema '%s'", len(results), strings.ToLower(objectType)+"s", schema)
+	return results, nil
+}
+
+// GetAllTables retrieves a list of all table names.
+func (h *APIHandler) GetAllTables() ([]string, error) {
+	return h._getAllTablesOrViews(true)
+}
+
+// GetAllViews retrieves a list of all view names.
+func (h *APIHandler) GetAllViews() ([]string, error) {
+	return h._getAllTablesOrViews(false)
+}
 
 // handleGetRequest (Copied from previous version)
 func (h *APIHandler) handleGetRequest(c *gin.Context, metadata *TableMetadata) {
@@ -236,7 +347,7 @@ func (h *APIHandler) handleGetRequest(c *gin.Context, metadata *TableMetadata) {
 			colName = parts[0]
 			opStr = strings.TrimSuffix(parts[1], "]")
 		}
-		quotedCol := clause.Column{Name: colName}.Name // GORM handles actual quoting
+		quotedCol := clause.Column{Name: colName}.Name
 		var condition string
 		switch opStr {
 		case "", "$eq": condition = fmt.Sprintf("%s = ?", quotedCol); values = append(values, value)
@@ -334,7 +445,7 @@ func (h *APIHandler) handleGetSingleRecord(c *gin.Context, metadata *TableMetada
     c.JSON(http.StatusOK, result)
 }
 
-// handleUpdateRequest (Copied from previous version, with slight refinement for 404 on 0 rows affected)
+// handleUpdateRequest (Copied from previous version)
 func (h *APIHandler) handleUpdateRequest(c *gin.Context, metadata *TableMetadata, id string) {
 	log := logger.Get()
 
@@ -387,7 +498,7 @@ func (h *APIHandler) handleUpdateRequest(c *gin.Context, metadata *TableMetadata
 	c.JSON(http.StatusOK, updatedRecord)
 }
 
-// handleDeleteRequest implements logic for DELETE to remove a record.
+// handleDeleteRequest (Copied from previous version)
 func (h *APIHandler) handleDeleteRequest(c *gin.Context, metadata *TableMetadata, id string) {
 	log := logger.Get()
 
@@ -398,10 +509,6 @@ func (h *APIHandler) handleDeleteRequest(c *gin.Context, metadata *TableMetadata
 	}
 
 	log.Debugf("Attempting to delete record in table %s (ID: %s)", metadata.TableName, id)
-
-	// GORM's Delete method requires a pointer to a struct or map.
-	// For dynamic tables, an empty map is suitable when using .Table() and .Where().
-	// The actual type of the argument to Delete() doesn't matter much here as long as it's a pointer.
 	result := h.DB.Table(metadata.TableName).Where(fmt.Sprintf("%s = ?", metadata.PrimaryKeyCol), id).Delete(&map[string]interface{}{})
 
 	if result.Error != nil {
@@ -492,4 +599,28 @@ func (h *APIHandler) HandleDynamicRequestWithID(c *gin.Context) {
 		log.Warnf("Unsupported method %s routed to HandleDynamicRequestWithID for %s/%s", c.Request.Method, tableName, id)
 		c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "Method not allowed for this resource path."})
 	}
+}
+
+// HandleGetTablesList handles requests to list all tables.
+func (h *APIHandler) HandleGetTablesList(c *gin.Context) {
+    log := logger.Get()
+    tables, err := h.GetAllTables()
+    if err != nil {
+        log.Errorf("Error getting table list: %v", err)
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve table list", "details": err.Error()})
+        return
+    }
+    c.JSON(http.StatusOK, gin.H{"tables": tables})
+}
+
+// HandleGetViewsList handles requests to list all views.
+func (h *APIHandler) HandleGetViewsList(c *gin.Context) {
+    log := logger.Get()
+    views, err := h.GetAllViews()
+    if err != nil {
+        log.Errorf("Error getting view list: %v", err)
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve view list", "details": err.Error()})
+        return
+    }
+    c.JSON(http.StatusOK, gin.H{"views": views})
 }

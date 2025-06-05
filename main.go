@@ -3,7 +3,9 @@ package main
 import (
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"time"
 
 	"generic-database-service/config"
 	"generic-database-service/database"
@@ -13,6 +15,13 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+func healthCheckHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"status":    "UP",
+		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+	})
+}
 
 func main() {
 	cfg, err := config.LoadConfig(".")
@@ -37,22 +46,24 @@ func main() {
 
 	router := gin.New()
 
-	// Register global middleware
-	// 1. Request/Response Logger
 	router.Use(middleware.RequestResponseLogger(appLogger))
-	// 2. Panic Recovery
 	router.Use(gin.Recovery())
-	// 3. API Key Authentication (must be after logger to see its effect, before routes)
-	router.Use(middleware.APIKeyAuth(cfg.APISecretKey, appLogger))
 
+	router.GET("/health", healthCheckHandler)
 
 	v1 := router.Group("/api/v1")
+	v1.Use(middleware.APIKeyAuth(cfg.APISecretKey, appLogger))
 	{
-		// Collection routes
+		// New routes for getting table and view lists
+		v1.GET("/getTables", apiHandler.HandleGetTablesList)
+		v1.GET("/getViews", apiHandler.HandleGetViewsList)
+
+		// Existing CRUD routes for dynamic table/view access
+		// These should come after specific named routes like /getTables to avoid path conflicts
+		// if a table was ever named "getTables". Gin matches routes in order of definition.
 		v1.GET("/:tableName", apiHandler.HandleDynamicRequest)
 		v1.POST("/:tableName", apiHandler.HandleDynamicRequest)
 
-		// Specific record routes
 		v1.GET("/:tableName/:id", apiHandler.HandleDynamicRequestWithID)
 		v1.PUT("/:tableName/:id", apiHandler.HandleDynamicRequestWithID)
 		v1.PATCH("/:tableName/:id", apiHandler.HandleDynamicRequestWithID)
@@ -62,9 +73,9 @@ func main() {
 	listenAddr := fmt.Sprintf(":%s", cfg.ServicePort)
 	appLogger.Infof("Starting server on %s", listenAddr)
 	if cfg.APISecretKey == "" {
-		appLogger.Warn("API Secret Key is not configured. API authentication is disabled.")
+		appLogger.Warn("API Secret Key is not configured. API authentication for /api/v1 routes is disabled.")
 	} else {
-		appLogger.Info("API Secret Key authentication is enabled.")
+		appLogger.Info("API Secret Key authentication for /api/v1 routes is enabled.")
 	}
 
 	if err := router.Run(listenAddr); err != nil {

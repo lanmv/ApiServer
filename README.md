@@ -2,23 +2,27 @@
 
 ## 1. Project Overview
 
-This project provides a generic database interface service developed in Golang. It allows users to configure database parameters via a `config.json` file and then automatically exposes CRUD (Create, Read, Update, Delete) API endpoints for the tables and views within that database.
+This project provides a generic database interface service developed in Golang. It allows users to configure database parameters via a `config.json` file and then automatically exposes CRUD (Create, Read, Update, Delete) API endpoints for the tables and views within that database, as well as endpoints to list available tables and views.
 
 The primary goal is to offer a quick and flexible way to make database content accessible via a RESTful API without writing custom boilerplate code for each table.
 
 ## 2. Features
 
 *   **Dynamic CRUD Operations:** Provides RESTful endpoints for tables (Create, Read, Update, Delete) and views (Read-only).
+*   **Metadata Endpoints:** Provides endpoints to list all available tables (`/api/v1/getTables`) and views (`/api/v1/getViews`).
+*   **Health Check:** A public `/health` endpoint for monitoring service status.
 *   **Multiple Database Support:**
     *   Currently Supported: MySQL, PostgreSQL, SQL Server.
     *   Planned: Oracle (support is partially implemented but pending robust driver/dialect testing).
 *   **Configuration Driven:** Database connection, service port, API keys, and log levels are all managed via `config.json`.
-*   **Advanced Querying:**
+*   **Advanced Querying (for CRUD on tables/views):**
     *   **Filtering:** Supports simple equality filters (e.g., `age=30`) and complex operator-based filters (e.g., `age[\$gt]=18`, `status[\$in]=active,pending`).
     *   **Sorting:** Allows sorting results by one or more fields in ascending or descending order (e.g., `sort[name]=ascend`). Defaults to primary key descending.
     *   **Pagination:** Supports `current` page and `pageSize` parameters for paginating results.
 *   **Structured Logging:** Detailed logging of requests and responses to daily rotated log files in the `logs/` directory.
 *   **Dynamic Schema Discovery:** Automatically determines table/view metadata, including primary keys.
+*   **Optional API Key Authentication:** Protects data endpoints while allowing public access to health checks.
+
 
 ## 3. Setup and Installation
 
@@ -54,7 +58,7 @@ Create a `config.json` file in the root of the project directory. This file cont
     *   Supported: `"mysql"`, `"postgres"`, `"sqlserver"`.
 *   `database_connection_string` (string): The DSN (Data Source Name) for connecting to your database. **See examples below.**
 *   `service_port` (string): The port on which the API service will listen (e.g., `"8080"`).
-*   `api_secret_key` (string): A secret key for API authentication (feature planned for future middleware). For now, it can be any string. Example: `"your-super-secret-key"`.
+*   `api_secret_key` (string): A secret key for API authentication for `/api/v1/*` routes. If empty or not set, authentication for these routes is disabled. Example: `"your-super-secret-key"`.
 *   `log_level` (string): The logging level for the application.
     *   Supported: `"debug"`, `"info"`, `"warn"`, `"error"`.
 
@@ -109,37 +113,81 @@ The service will start, and you should see log output indicating it's listening 
 
 ## 6. API Endpoints and Usage
 
-The base URL for the API is `http://localhost:<service_port>/api/v1`. Replace `<service_port>` with the port configured in `config.json`.
+The service exposes the following endpoints.
+The base URL for the main API is `http://localhost:<service_port>/api/v1`. Replace `<service_port>` with the port configured in `config.json`.
 Replace `{TableName}` with the actual name of your database table or view.
 Replace `{id}` with the actual primary key value of a record.
 
 ---
 
-### 6.1 List Records
+### 6.1 Health Check
 
-*   **Endpoint:** `GET /{TableName}`
+*   **Endpoint:** `GET /health`
+*   **Description:** Provides a simple health check for the service.
+*   **Authentication:** None required. This endpoint is public.
+*   **Example Request:** `GET /health`
+*   **Example Success Response (200 OK):**
+    ```json
+    {
+      "status": "UP",
+      "timestamp": "2023-10-29T12:00:00.000Z"
+    }
+    ```
+
+---
+
+### 6.2 List All Tables
+
+*   **Endpoint:** `GET /api/v1/getTables`
+*   **Description:** Retrieves a list of all accessible table names in the configured database/schema.
+*   **Authentication:** Requires API Key if `api_secret_key` is configured.
+*   **Example Request:** `GET /api/v1/getTables`
+*   **Example Success Response (200 OK):**
+    ```json
+    {
+      "tables": [
+        "users",
+        "products",
+        "orders_archive"
+      ]
+    }
+    ```
+
+---
+
+### 6.3 List All Views
+
+*   **Endpoint:** `GET /api/v1/getViews`
+*   **Description:** Retrieves a list of all accessible view names in the configured database/schema.
+*   **Authentication:** Requires API Key if `api_secret_key` is configured.
+*   **Example Request:** `GET /api/v1/getViews`
+*   **Example Success Response (200 OK):**
+    ```json
+    {
+      "views": [
+        "active_customers",
+        "product_summary"
+      ]
+    }
+    ```
+
+---
+
+### 6.4 List Records from Table/View
+
+*   **Endpoint:** `GET /api/v1/{TableName}`
 *   **Description:** Retrieves a list of records from the specified table or view. Supports filtering, sorting, and pagination.
+*   **Authentication:** Requires API Key if `api_secret_key` is configured.
 *   **Query Parameters:**
     *   **Filtering (Simple Mode):** `?fieldName=value`
         *   Example: `/api/v1/users?status=active&department_id=5`
     *   **Filtering (Complex Mode):** `?fieldName[$operator]=value`
-        *   Supported operators:
-            *   `$eq`: Equals (e.g., `age[\$eq]=30`)
-            *   `$ne`: Not Equals (e.g., `status[\$ne]=archived`)
-            *   `$gt`: Greater Than (e.g., `price[\$gt]=100`)
-            *   `$gte`: Greater Than or Equal To (e.g., `quantity[\$gte]=10`)
-            *   `$lt`: Less Than (e.g., `age[\$lt]=65`)
-            *   `$lte`: Less Than or Equal To (e.g., `stock[\$lte]=5`)
-            *   `$like`: SQL LIKE operator (e.g., `name[\$like]=%john%`) (Use URL encoding for `%` -> `%25`)
-            *   `$in`: Matches any value in a comma-separated list (e.g., `status[\$in]=pending,processing`)
-            *   `$nin`: Not in a comma-separated list (e.g., `category_id[\$nin]=1,2,3`)
+        *   Supported operators: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$like`, `$in`, `$nin`.
         *   Example: `/api/v1/products?price[\$gte]=50&category[\$in]=electronics,books`
     *   **Sorting:** `?sort[fieldName]=ascend|descend`
         *   Example: `/api/v1/orders?sort[order_date]=descend&sort[total_amount]=ascend`
-        *   If not provided, defaults to primary key descending.
-    *   **Pagination:**
-        *   `current` (integer, default: 1): The current page number.
-        *   `pageSize` (integer, default: 10, max: 100): Number of records per page.
+        *   If not provided, defaults to primary key descending for tables.
+    *   **Pagination:** `current` (default: 1), `pageSize` (default: 10, max: 100).
         *   Example: `/api/v1/logs?current=3&pageSize=20`
 *   **Example Success Response (200 OK):**
     ```json
@@ -158,10 +206,11 @@ Replace `{id}` with the actual primary key value of a record.
 
 ---
 
-### 6.2 Get Record by ID
+### 6.5 Get Record by ID from Table/View
 
-*   **Endpoint:** `GET /{TableName}/{id}`
-*   **Description:** Retrieves a single record by its primary key.
+*   **Endpoint:** `GET /api/v1/{TableName}/{id}`
+*   **Description:** Retrieves a single record by its primary key from the specified table or view.
+*   **Authentication:** Requires API Key if `api_secret_key` is configured.
 *   **Example Request:** `GET /api/v1/users/123`
 *   **Example Success Response (200 OK):**
     ```json
@@ -171,109 +220,57 @@ Replace `{id}` with the actual primary key value of a record.
       "email": "john.doe@example.com"
     }
     ```
-*   **Example Error Response (404 Not Found):**
-    ```json
-    {
-      "error": "Record not found"
-    }
-    ```
 
 ---
 
-### 6.3 Create Record
+### 6.6 Create Record in Table
 
-*   **Endpoint:** `POST /{TableName}`
+*   **Endpoint:** `POST /api/v1/{TableName}`
 *   **Description:** Creates a new record in the specified table. (Not applicable to views).
+*   **Authentication:** Requires API Key if `api_secret_key` is configured.
 *   **Request Body:** A JSON object representing the record to create.
-    ```json
-    {
-      "name": "New Gadget",
-      "category_id": 3,
-      "price": 199.99,
-      "status": "available"
-    }
-    ```
-*   **Example Success Response (201 Created):**
-    The response includes the created record, potentially with database-generated fields like `id` or timestamps.
+*   **Example Success Response (201 Created):** Includes the created record with DB-generated fields.
     ```json
     {
       "id": 101,
       "name": "New Gadget",
-      "category_id": 3,
-      "price": 199.99,
-      "status": "available",
-      "created_at": "2023-10-28T10:00:00Z"
-    }
-    ```
-*   **Example Error Response (400 Bad Request - Invalid JSON):**
-    ```json
-    {
-      "error": "Invalid JSON data",
-      "details": "some parsing error message"
-    }
-    ```
-*   **Example Error Response (405 Method Not Allowed - if TableName is a View):**
-    ```json
-    {
-      "error": "POST operation only allowed on tables, not VIEW."
+      // ... other fields
     }
     ```
 
 ---
 
-### 6.4 Update Record
+### 6.7 Update Record in Table
 
-*   **Endpoint:** `PUT /{TableName}/{id}` or `PATCH /{TableName}/{id}`
-*   **Description:** Updates an existing record by its primary key. (Not applicable to views).
-    *   `PUT` can be used, but the behavior is typically a partial update (like `PATCH`) for fields provided in the request body.
+*   **Endpoint:** `PUT /api/v1/{TableName}/{id}` or `PATCH /api/v1/{TableName}/{id}`
+*   **Description:** Updates an existing record by its primary key in the specified table. (Not applicable to views).
+*   **Authentication:** Requires API Key if `api_secret_key` is configured.
 *   **Request Body:** A JSON object containing the fields to update.
-    ```json
-    {
-      "price": 189.99,
-      "status": "in_stock"
-    }
-    ```
-*   **Example Success Response (200 OK):**
-    The response includes the full updated record.
+*   **Example Success Response (200 OK):** Includes the full updated record.
     ```json
     {
       "id": 101,
-      "name": "New Gadget",
-      "category_id": 3,
+      "name": "Updated Gadget",
       "price": 189.99,
-      "status": "in_stock",
-      "created_at": "2023-10-28T10:00:00Z",
-      "updated_at": "2023-10-28T11:30:00Z"
-    }
-    ```
-*   **Example Error Response (404 Not Found):**
-    ```json
-    {
-      "error": "Record not found or no changes made."
+      // ... other fields
     }
     ```
 
 ---
 
-### 6.5 Delete Record
+### 6.8 Delete Record from Table
 
-*   **Endpoint:** `DELETE /{TableName}/{id}`
-*   **Description:** Deletes a record by its primary key. (Not applicable to views).
-*   **(Status: Planned - To be implemented next)**
-*   **Expected Success Response:** `204 No Content` (with an empty body).
-*   **Expected Error Response (404 Not Found):**
-    ```json
-    {
-      "error": "Record not found"
-    }
-    ```
+*   **Endpoint:** `DELETE /api/v1/{TableName}/{id}`
+*   **Description:** Deletes a record by its primary key from the specified table. (Not applicable to views).
+*   **Authentication:** Requires API Key if `api_secret_key` is configured.
+*   **Example Success Response:** `204 No Content` (with an empty body).
 
 ## 7. Logging
 
 *   Logs are stored in the `./logs/` directory relative to the project root.
 *   Log files are named by date (e.g., `2023-10-28.log`).
 *   The log level can be configured in `config.json` (`debug`, `info`, `warn`, `error`).
-*   Logs include details about incoming requests, executed queries (if GORM logging is enabled at a verbose level), and responses or errors.
+*   The logging middleware captures details for each request, including method, path, status, latency, client IP, user agent, and a snippet of the response body for errors.
 
 ## 8. Supported Databases
 
@@ -286,12 +283,13 @@ Replace `{id}` with the actual primary key value of a record.
 
 ## 9. License
 
-This project is licensed under the MIT License. (Assuming MIT, can be changed).
+This project is licensed under the MIT License.
 
 ```
 MIT License
 
 Copyright (c) [Year] [Your Name/Organization]
+# Replace [Year] and [Your Name/Organization] appropriately
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
